@@ -15,6 +15,8 @@ import numpy as np
 from tqdm import tqdm
 
 import torch
+
+from library import modelslab_flux_runtime
 import torch.nn as nn
 from torch.types import Number
 from library.device_utils import init_ipex, clean_memory_on_device
@@ -1621,9 +1623,9 @@ class NetworkTrainer:
                             params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
-                        if hasattr(network, "update_grad_norms"):
+                        if modelslab_flux_runtime.LORA_NORM_DIAGNOSTICS and hasattr(network, "update_grad_norms"):
                             network.update_grad_norms()
-                        if hasattr(network, "update_norms"):
+                        if (modelslab_flux_runtime.LORA_NORM_DIAGNOSTICS or args.scale_weight_norms) and hasattr(network, "update_norms"):
                             network.update_norms()
 
                     optimizer.step()
@@ -1638,7 +1640,7 @@ class NetworkTrainer:
                     mean_combined_norm = None
                     max_mean_logs = {"Keys Scaled": keys_scaled, "Average key norm": mean_norm}
                 else:
-                    if hasattr(network, "weight_norms"):
+                    if modelslab_flux_runtime.LORA_NORM_DIAGNOSTICS and hasattr(network, "weight_norms"):
                         weight_norms = network.weight_norms()
                         mean_norm = weight_norms.mean().item() if weight_norms is not None else None
                         grad_norms = network.grad_norms()

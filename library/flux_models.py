@@ -19,7 +19,7 @@ from einops import rearrange
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
-from library import custom_offloading_utils
+from library import custom_offloading_utils, modelslab_flux_runtime
 
 # USE_REENTRANT = True
 
@@ -449,7 +449,10 @@ configs = {
 def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor, attn_mask: Optional[Tensor] = None) -> Tensor:
     q, k = apply_rope(q, k, pe)
 
-    x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+    if modelslab_flux_runtime.FA3_ENABLED and attn_mask is None:
+        x = modelslab_flux_runtime.fa3_attention(q, k, v)
+    else:
+        x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
     x = rearrange(x, "B H L D -> B L (H D)")
 
     return x
@@ -735,6 +738,7 @@ class DoubleStreamBlock(nn.Module):
         txt = txt + txt_mod2.gate * self.txt_mlp((1 + txt_mod2.scale) * self.txt_norm2(txt) + txt_mod2.shift)
         return img, txt
 
+    @modelslab_flux_runtime.compile_region
     def forward(
         self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, txt_attention_mask: Optional[Tensor] = None
     ) -> tuple[Tensor, Tensor]:
@@ -1046,6 +1050,14 @@ class Flux(nn.Module):
         if block_controlnet_single_hidden_states is not None:
             controlnet_single_depth = len(block_controlnet_single_hidden_states)
 
+        if modelslab_flux_runtime.PAIRED_COMPILE:
+            if len(self.double_blocks) != 19 or len(self.single_blocks) != 38:
+                raise RuntimeError("Paired FLUX compilation requires 19 double-stream and 38 single-stream blocks")
+            if self.cpu_offload_checkpointing or self.blocks_to_swap:
+                raise RuntimeError("Paired FLUX compilation does not support CPU checkpoint offload or block swapping")
+            if self.training and not self.gradient_checkpointing:
+                raise RuntimeError("Paired FLUX training requires full activation checkpointing")
+
         if not self.blocks_to_swap:
             for block_idx, block in enumerate(self.double_blocks):
                 img, txt = block(img=img, txt=txt, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask)
@@ -1053,10 +1065,16 @@ class Flux(nn.Module):
                     img = img + block_controlnet_hidden_states[block_idx % controlnet_depth]
 
             img = torch.cat((txt, img), 1)
-            for block_idx, block in enumerate(self.single_blocks):
-                img = block(img, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask)
-                if block_controlnet_single_hidden_states is not None and controlnet_single_depth > 0:
-                    img = img + block_controlnet_single_hidden_states[block_idx % controlnet_single_depth]
+            if modelslab_flux_runtime.PAIRED_COMPILE and block_controlnet_single_hidden_states is None:
+                for index in range(0, len(self.single_blocks), 2):
+                    img = modelslab_flux_runtime.single_pair(
+                        self.single_blocks[index], self.single_blocks[index + 1], img, vec, pe, txt_attention_mask
+                    )
+            else:
+                for block_idx, block in enumerate(self.single_blocks):
+                    img = block(img, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask)
+                    if block_controlnet_single_hidden_states is not None and controlnet_single_depth > 0:
+                        img = img + block_controlnet_single_hidden_states[block_idx % controlnet_single_depth]
         else:
             for block_idx, block in enumerate(self.double_blocks):
                 self.offloader_double.wait_for_block(block_idx)
